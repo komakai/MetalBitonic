@@ -124,33 +124,42 @@ class ViewController: UIViewController {
     var bitonicCommandQueue: MTLCommandQueue?
     var bitonicDataBuffer: MTLBuffer?
     var bitonicParameterBuffer: MTLBuffer?
-    
+    var commandBuffer: MTLCommandBuffer?
+    var computeEncoder: MTLComputeCommandEncoder?
+    var runCount: UInt32 = 0
+
+    func calcTotalRunCount(_ maxWorkgroupSize: UInt32) -> UInt32 {
+        let n = UInt32(bufferLength)
+        let workgroupSizeX = (n < maxWorkgroupSize * 2) ? (n / 2) : maxWorkgroupSize
+
+        let outerRunCount: UInt32 = { (N: UInt32) -> UInt32 in var ret: UInt32 = 0; var n = n; while (n > 1) { n >>= 1; ret = ret + 1; }; return ret } (n / workgroupSizeX)
+        return outerRunCount * (outerRunCount + 1) / 2;
+    }
+
     @IBAction func onBitonic(_ sender: Any) {
         let device = MTLCreateSystemDefaultDevice()
         let defaultLibrary = device?.makeDefaultLibrary()
         let bitonicFunction = defaultLibrary?.makeFunction(name: "bitonic")
         bitonicFunctionPSO = try? device?.makeComputePipelineState(function: bitonicFunction!)
+        let maxWorkgroupSize = UInt32(bitonicFunctionPSO!.maxTotalThreadsPerThreadgroup)
+        let totalRunCount = calcTotalRunCount(maxWorkgroupSize)
         bitonicCommandQueue = device?.makeCommandQueue()
         let bufferData = (0..<bufferLength).map { _ in randomInt32() }
         bitonicDataBuffer = device?.makeBuffer(bytes: bufferData, length: bufferSize, options: .storageModeShared)
-        var bitonicParameter = Parameters(h: 0, algorithm: eLocalBitonicMergeSort)
-        bitonicParameterBuffer = device!.makeBuffer(bytes: &bitonicParameter, length: MemoryLayout<Parameters>.size)
+
+        bitonicParameterBuffer = device!.makeBuffer(length: MemoryLayout<Parameters>.size * Int(totalRunCount))
         
         let n = UInt32(bufferLength)
-        let maxWorkgroupSize = UInt32(bitonicFunctionPSO!.maxTotalThreadsPerThreadgroup)
-        var workgroupSizeX:UInt32 = 1
+        let workgroupSizeX = (n < maxWorkgroupSize * 2) ? (n / 2) : maxWorkgroupSize
 
-        // Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
-        if (n < maxWorkgroupSize * 2) {
-            workgroupSizeX = n / 2
-        } else {
-            workgroupSizeX = maxWorkgroupSize
-        }
         let workgroupCount = n / (workgroupSizeX * 2 )
 
         var h:UInt32 = workgroupSizeX * 2
         assert(h <= n)
         assert(h % 2 == 0)
+
+        commandBuffer = bitonicCommandQueue?.makeCommandBuffer()
+        computeEncoder = commandBuffer?.makeComputeCommandEncoder()
 
         localBitonicMergeSort(h, workgroupCount)
         // we must now double h, as this happens before every flip
@@ -173,6 +182,10 @@ class ViewController: UIViewController {
             }
             h *= 2
         }
+        computeEncoder?.endEncoding()
+        commandBuffer?.commit()
+        commandBuffer?.waitUntilCompleted()
+
         let intBufferPointer = UnsafeBufferPointer(start: bitonicDataBuffer?.contents().assumingMemoryBound(to: Int32.self), count: bufferLength)
         let result = [Int32](intBufferPointer)
         var error = false
@@ -204,13 +217,11 @@ class ViewController: UIViewController {
     }
 
     func dispatch(_ h: UInt32, _ algorithm: eAlgorithmVariant,  _ workgroupCount: UInt32) {
-        var bitonicParameter = Parameters(h: h, algorithm: algorithm)
-        bitonicParameterBuffer?.contents().copyMemory(from: &bitonicParameter, byteCount: MemoryLayout<Parameters>.size)
-        let commandBuffer = bitonicCommandQueue?.makeCommandBuffer()
-        let computeEncoder = commandBuffer?.makeComputeCommandEncoder()
+        let bitonicParameter = Parameters(h: h, algorithm: algorithm)
+        bitonicParameterBuffer?.contents().storeBytes(of: bitonicParameter, toByteOffset: Int(runCount) * MemoryLayout<Parameters>.size, as: Parameters.self)
         computeEncoder?.setComputePipelineState(bitonicFunctionPSO!)
         computeEncoder?.setBuffer(bitonicDataBuffer, offset: 0, index: 0)
-        computeEncoder!.setBuffer(bitonicParameterBuffer, offset: 0, index: 1)
+        computeEncoder!.setBuffer(bitonicParameterBuffer, offset: Int(runCount) * MemoryLayout<Parameters>.size, index: 1)
         let workGroupSize = bitonicFunctionPSO!.maxTotalThreadsPerThreadgroup
         let threadgroupMemoryLength = workGroupSize * 2
         computeEncoder!.setThreadgroupMemoryLength(threadgroupMemoryLength, index: 0)
@@ -218,10 +229,7 @@ class ViewController: UIViewController {
         let threadGroupCount = MTLSizeMake(workGroupSize, 1, 1)
         let threadGroups = MTLSizeMake(Int(workgroupCount), 1, 1)
         computeEncoder?.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupCount)
-
-        computeEncoder?.endEncoding()
-        commandBuffer?.commit()
-        commandBuffer?.waitUntilCompleted()
+        runCount = runCount + 1
     }
 
     @IBOutlet weak var addButton: UIButton!
